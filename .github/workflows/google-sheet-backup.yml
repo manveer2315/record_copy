@@ -49,9 +49,10 @@ jobs:
           token_path.chmod(0o600)
           PY
 
-      - name: Copy latest spreadsheet into its Drive folder
+      - name: Replace latest backup and grant Tushar editor access
         env:
           SALES_SPREADSHEET_ID: ${{ secrets.SALES_SPREADSHEET_ID }}
+          TUSHAR_EMAIL: Tushar@orangetechshipping.com
         run: |
           python - <<'PY'
           import os
@@ -63,6 +64,7 @@ jobs:
           from googleapiclient.discovery import build
 
           spreadsheet_id = os.environ.get("SALES_SPREADSHEET_ID", "").strip()
+          tushar_email = os.environ["TUSHAR_EMAIL"].strip()
           if not spreadsheet_id:
               raise SystemExit(
                   "Add SALES_SPREADSHEET_ID to repository Actions secrets."
@@ -70,13 +72,11 @@ jobs:
 
           token_path = Path.home() / ".sales_onboarding_app" / "google_drive_token.json"
           drive_scope = "https://www.googleapis.com/auth/drive"
-          credentials = Credentials.from_authorized_user_file(
-              str(token_path)
-          )
+          credentials = Credentials.from_authorized_user_file(str(token_path))
           if not credentials.has_scopes([drive_scope]):
               raise RuntimeError(
-                  "The saved token needs Google Drive scope. Authorize Drive access "
-                  "and replace GOOGLE_DRIVE_TOKEN_JSON with the updated token JSON."
+                  "The saved token needs Google Drive scope. Reauthorize Drive access "
+                  "and update GOOGLE_DRIVE_TOKEN_JSON."
               )
           if credentials.expired:
               if not credentials.refresh_token:
@@ -89,18 +89,96 @@ jobs:
               fields="name,parents",
               supportsAllDrives=True,
           ).execute()
-          timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H-%M-%S UTC")
-          body = {"name": f"{source['name']} - Backup - {timestamp}"}
-          if source.get("parents"):
-              body["parents"] = source["parents"]
+          backup_prefix = f"{source['name']} - Backup"
+          backup_name = backup_prefix
+          body = {"name": backup_name}
+          parents = source.get("parents")
+          if parents:
+              body["parents"] = parents
+
+          # Create and grant access first; old backups remain if either fails.
           backup = drive.files().copy(
               fileId=spreadsheet_id,
               body=body,
               fields="id,name,webViewLink",
               supportsAllDrives=True,
           ).execute()
+          backup_id = backup["id"]
+
+          permissions = drive.permissions().list(
+              fileId=backup_id,
+              fields="permissions(id,emailAddress,role,type,permissionDetails(inherited))",
+              supportsAllDrives=True,
+          ).execute().get("permissions", [])
+          existing = next(
+              (
+                  permission for permission in permissions
+                  if permission.get("type") == "user"
+                  and permission.get("emailAddress", "").casefold() == tushar_email.casefold()
+              ),
+              None,
+          )
+          if existing and existing.get("role") in ("writer", "owner"):
+              pass
+          elif existing and not any(
+              detail.get("inherited", False)
+              for detail in existing.get("permissionDetails", [])
+          ):
+              drive.permissions().update(
+                  fileId=backup_id,
+                  permissionId=existing["id"],
+                  body={"role": "writer"},
+                  fields="id,emailAddress,role",
+                  supportsAllDrives=True,
+              ).execute()
+          else:
+              drive.permissions().create(
+                  fileId=backup_id,
+                  body={"type": "user", "role": "writer", "emailAddress": tushar_email},
+                  sendNotificationEmail=True,
+                  supportsAllDrives=True,
+              ).execute()
+
+          # Remove prior timestamped and fixed-name copies from this Drive folder.
+          escaped_prefix = backup_prefix.replace("\\", "\\\\").replace("'", "\\'")
+          query = (
+              f"name contains '{escaped_prefix}' and "
+              "mimeType = 'application/vnd.google-apps.spreadsheet' and trashed = false"
+          )
+          parent_ids = parents or ["root"]
+          query += " and (" + " or ".join(
+              f"'{parent_id}' in parents" for parent_id in parent_ids
+          ) + ")"
+          page_token = None
+          old_backups = []
+          while True:
+              response = drive.files().list(
+                  q=query,
+                  pageSize=1000,
+                  pageToken=page_token,
+                  fields="nextPageToken,files(id,name)",
+                  supportsAllDrives=True,
+                  includeItemsFromAllDrives=True,
+              ).execute()
+              old_backups.extend(
+                  item for item in response.get("files", [])
+                  if item["id"] != backup_id
+                  and item.get("name", "").startswith(backup_prefix)
+              )
+              page_token = response.get("nextPageToken")
+              if not page_token:
+                  break
+
+          for old_backup in old_backups:
+              drive.files().delete(
+                  fileId=old_backup["id"], supportsAllDrives=True
+              ).execute()
+
+          timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
           print(
-              f"Created backup: {backup['name']} "
-              f"({backup.get('webViewLink', backup['id'])})"
+              f"Backup refreshed at {timestamp}: {backup['name']} "
+              f"({backup.get('webViewLink', backup_id)}). "
+              f"Granted editor access to {tushar_email}; "
+              f"removed {len(old_backups)} prior backup(s)."
           )
           PY
